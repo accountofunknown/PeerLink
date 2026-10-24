@@ -1,3 +1,5 @@
+[![Build Android APK](https://github.com/accountofunknown/PeerLink/actions/workflows/build-apk.yml/badge.svg)](https://github.com/accountofunknown/PeerLink/actions/workflows/build-apk.yml)
+
 # PeerLink — serverless messenger, calls & file transfer for Android
 
 PeerLink is an Android app (Capacitor + vanilla JS) built on **PeerJS / WebRTC**.
