@@ -1,0 +1,162 @@
+name: Build Android APK
+
+# Works in two layouts:
+#   1. You upload the project ZIP (e.g. peerlink-android-project.zip) next to this workflow  -> it is unzipped and built.
+#   2. You upload the unzipped project (package.json in the repo root)                       -> it is built directly.
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Also publish the APKs as a GitHub Release'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    name: Build debug + signed release APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Locate project (ZIP or plain)
+        id: locate
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f package.json ] && [ -f capacitor.config.json ]; then
+            SRC="$PWD"
+            echo "Building project from repository root"
+          else
+            ZIP=$(find . -maxdepth 3 -iname '*.zip' -not -path './node_modules/*' -not -path './.git/*' | sort | head -n1)
+            if [ -z "$ZIP" ]; then echo "::error::No project found: upload the project .zip (or its unzipped contents) to the repository."; exit 1; fi
+            echo "Unzipping $ZIP"
+            rm -rf _src && mkdir _src
+            unzip -q "$ZIP" -d _src
+            PJ=$(find _src -maxdepth 4 -name package.json -not -path '*/node_modules/*' | head -n1)
+            if [ -z "$PJ" ]; then echo "::error::package.json not found inside $ZIP"; exit 1; fi
+            SRC=$(cd "$(dirname "$PJ")" && pwd)
+          fi
+          echo "src=$SRC" >> "$GITHUB_OUTPUT"
+          echo "version=$(node -p "require('$SRC/package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/package.json') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Install dependencies
+        working-directory: ${{ steps.locate.outputs.src }}
+        run: npm install --no-audit --no-fund
+
+      - name: Run logic tests
+        working-directory: ${{ steps.locate.outputs.src }}
+        run: npm test
+
+      - name: Build web app
+        working-directory: ${{ steps.locate.outputs.src }}
+        run: npm run build
+
+      - name: Create Android project
+        working-directory: ${{ steps.locate.outputs.src }}
+        run: |
+          if [ ! -d android ]; then npx cap add android; fi
+
+      - name: Patch manifest and version
+        working-directory: ${{ steps.locate.outputs.src }}
+        env:
+          VERSION_CODE: ${{ github.run_number }}
+          VERSION_NAME: ${{ steps.locate.outputs.version }}
+        run: node scripts/patch-android.mjs
+
+      - name: Generate icons and splash (optional)
+        working-directory: ${{ steps.locate.outputs.src }}
+        continue-on-error: true
+        run: |
+          if [ -d assets ]; then
+            npx --yes @capacitor/assets generate --android \
+              --iconBackgroundColor '#4f46e5' --iconBackgroundColorDark '#4f46e5' \
+              --splashBackgroundColor '#0b0d17' --splashBackgroundColorDark '#0b0d17'
+          fi
+
+      - name: Sync web assets into Android
+        working-directory: ${{ steps.locate.outputs.src }}
+        run: npx cap sync android
+
+      - name: Build APKs with Gradle
+        working-directory: ${{ steps.locate.outputs.src }}/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug assembleRelease --no-daemon --stacktrace
+
+      - name: Sign release APK
+        id: sign
+        working-directory: ${{ steps.locate.outputs.src }}
+        shell: bash
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          OUT="$PWD/dist-apk"; mkdir -p "$OUT"
+          if [ -n "${KS_B64:-}" ]; then
+            echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            ALIAS="${KEY_ALIAS}"; SPASS="${KS_PASS}"; KPASS="${KEY_PASS:-$KS_PASS}"
+            echo "Using your keystore from repository secrets"
+          else
+            ALIAS=peerlink; SPASS=peerlink-ci-key; KPASS=peerlink-ci-key
+            keytool -genkeypair -keystore "$RUNNER_TEMP/release.jks" -alias "$ALIAS" -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "$SPASS" -keypass "$KPASS" -dname "CN=PeerLink CI, O=PeerLink, C=US" >/dev/null 2>&1
+            echo "::notice::No keystore secrets set - signed with a throw-away key. Add ANDROID_KEYSTORE_BASE64 etc. so updates install over older builds."
+          fi
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n1)
+          REL=$(find android/app/build/outputs/apk/release -name '*.apk' | head -n1)
+          "$BT/zipalign" -p -f 4 "$REL" "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" sign --ks "$RUNNER_TEMP/release.jks" --ks-key-alias "$ALIAS" --ks-pass "pass:$SPASS" --key-pass "pass:$KPASS" \
+            --out "$OUT/PeerLink-${{ steps.locate.outputs.version }}-release.apk" "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" verify --print-certs "$OUT/PeerLink-${{ steps.locate.outputs.version }}-release.apk" | head -n3
+          cp android/app/build/outputs/apk/debug/app-debug.apk "$OUT/PeerLink-${{ steps.locate.outputs.version }}-debug.apk"
+          ls -lh "$OUT"
+          echo "out=$OUT" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: PeerLink-APK
+          path: ${{ steps.sign.outputs.out }}/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('build-{0}', github.run_number) }}
+          name: PeerLink ${{ steps.locate.outputs.version }} (build ${{ github.run_number }})
+          files: ${{ steps.sign.outputs.out }}/*.apk
+          generate_release_notes: true
