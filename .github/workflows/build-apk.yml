@@ -104,10 +104,10 @@ jobs:
           path: ${{ steps.locate.outputs.src }}/package-lock.json
           retention-days: 30
 
-      - name: Dependency audit (informational)
+      - name: Dependency audit - shipped dependencies only (informational)
         working-directory: ${{ steps.locate.outputs.src }}
         continue-on-error: true
-        run: npm audit --audit-level=high
+        run: npm audit --omit=dev --audit-level=high
 
       - name: Run logic tests
         working-directory: ${{ steps.locate.outputs.src }}
@@ -123,7 +123,7 @@ jobs:
         timeout-minutes: 10
         run: |
           IT="$RUNNER_TEMP/it"; mkdir -p "$IT" && (cd "$IT" && npm init -y >/dev/null && npm install --no-audit --no-fund peer playwright && npx playwright install --with-deps chromium)
-          export PATH="$IT/node_modules/.bin:$PATH" PLAYWRIGHT_PATH="$IT/node_modules/playwright/package.json"
+          export IT_DIR="$IT" PLAYWRIGHT_PATH="$IT/node_modules/playwright/package.json"
           node test/integration-real.mjs
 
       - name: Create Android project
