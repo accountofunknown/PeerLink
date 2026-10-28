@@ -1,7 +1,7 @@
 name: Build Android APK
 
 # Works in two layouts:
-#   1. You upload the project ZIP (e.g. peerlink-android-project.zip) next to this workflow  -> it is unzipped and built.
+#   1. You upload the project ZIP (e.g. PeerLink-Android.zip) next to this workflow  -> it is unzipped and built.
 #   2. You upload the unzipped project (package.json in the repo root)                       -> it is built directly.
 on:
   push:
@@ -24,7 +24,7 @@ concurrency:
 jobs:
   apk:
     name: Build debug + signed release APK
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -34,18 +34,41 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ -f package.json ] && [ -f capacitor.config.json ]; then
+          echo "Repository files:"; ls -la
+          is_project() { [ -f "$1/package.json" ] && [ -f "$1/capacitor.config.json" ] && [ -d "$1/src" ]; }
+          if is_project "$PWD"; then
             SRC="$PWD"
             echo "Building project from repository root"
           else
-            ZIP=$(find . -maxdepth 3 -iname '*.zip' -not -path './node_modules/*' -not -path './.git/*' | sort | head -n1)
-            if [ -z "$ZIP" ]; then echo "::error::No project found: upload the project .zip (or its unzipped contents) to the repository."; exit 1; fi
-            echo "Unzipping $ZIP"
+            mapfile -t ZIPS < <(find . -maxdepth 3 -iname '*.zip' -not -path './.git/*' -not -path './_src/*' | sort)
+            if [ ${#ZIPS[@]} -eq 0 ]; then
+              echo "::error::No project found. Upload the project .zip (or the unzipped project files) to the repository root."; exit 1
+            fi
             rm -rf _src && mkdir _src
-            unzip -q "$ZIP" -d _src
-            PJ=$(find _src -maxdepth 4 -name package.json -not -path '*/node_modules/*' | head -n1)
-            if [ -z "$PJ" ]; then echo "::error::package.json not found inside $ZIP"; exit 1; fi
-            SRC=$(cd "$(dirname "$PJ")" && pwd)
+            n=0
+            for z in "${ZIPS[@]}"; do
+              n=$((n+1)); d="_src/z$n"; mkdir -p "$d"
+              echo "::group::Unzipping $z ($(stat -c %s "$z") bytes)"
+              unzip -q -o "$z" -d "$d" || echo "::warning::$z could not be fully extracted (corrupt or not a zip?)"
+              # also unpack zips nested inside the zip (up to 2 levels)
+              for pass in 1 2; do
+                while IFS= read -r nz; do
+                  nd="${nz%.*}_unz"; mkdir -p "$nd"; unzip -q -o "$nz" -d "$nd" || true; rm -f "$nz"
+                done < <(find "$d" -iname '*.zip')
+              done
+              echo "::endgroup::"
+            done
+            SRC=""
+            while IFS= read -r pj; do
+              dir=$(cd "$(dirname "$pj")" && pwd)
+              if is_project "$dir"; then SRC="$dir"; break; fi
+            done < <(find _src -maxdepth 8 -name package.json -not -path '*/node_modules/*' | sort)
+            if [ -z "$SRC" ]; then
+              echo "::error::The uploaded ZIP does not contain the PeerLink project (needs package.json, capacitor.config.json and src/). Use the file PeerLink-Android.zip exactly as downloaded (about 280 KB). What was found:"
+              for z in "${ZIPS[@]}"; do echo "--- $z ($(stat -c %s "$z") bytes)"; unzip -l "$z" | head -n 40 || true; done
+              exit 1
+            fi
+            echo "Project found at: $SRC"
           fi
           echo "src=$SRC" >> "$GITHUB_OUTPUT"
           echo "version=$(node -p "require('$SRC/package.json').version")" >> "$GITHUB_OUTPUT"
@@ -54,7 +77,7 @@ jobs:
         with:
           node-version: 20
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 17
@@ -70,7 +93,21 @@ jobs:
 
       - name: Install dependencies
         working-directory: ${{ steps.locate.outputs.src }}
-        run: npm install --no-audit --no-fund
+        run: |
+          if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi
+
+      - name: Export lockfile (commit it to the repo for reproducible builds)
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-lock
+          path: ${{ steps.locate.outputs.src }}/package-lock.json
+          retention-days: 30
+
+      - name: Dependency audit (informational)
+        working-directory: ${{ steps.locate.outputs.src }}
+        continue-on-error: true
+        run: npm audit --audit-level=high
 
       - name: Run logic tests
         working-directory: ${{ steps.locate.outputs.src }}
@@ -79,6 +116,15 @@ jobs:
       - name: Build web app
         working-directory: ${{ steps.locate.outputs.src }}
         run: npm run build
+
+      - name: Integration test with real PeerJS server (informational)
+        working-directory: ${{ steps.locate.outputs.src }}
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          IT="$RUNNER_TEMP/it"; mkdir -p "$IT" && (cd "$IT" && npm init -y >/dev/null && npm install --no-audit --no-fund peer playwright && npx playwright install --with-deps chromium)
+          export PATH="$IT/node_modules/.bin:$PATH" PLAYWRIGHT_PATH="$IT/node_modules/playwright/package.json"
+          node test/integration-real.mjs
 
       - name: Create Android project
         working-directory: ${{ steps.locate.outputs.src }}
@@ -107,12 +153,24 @@ jobs:
         run: npx cap sync android
 
       - name: Build APKs with Gradle
-        working-directory: ${{ steps.locate.outputs.src }}/android
+        working-directory: ${{ steps.locate.outputs.src }}
+        env:
+          VERSION_CODE: ${{ github.run_number }}
+          VERSION_NAME: ${{ steps.locate.outputs.version }}
         run: |
-          chmod +x gradlew
-          ./gradlew assembleDebug assembleRelease --no-daemon --stacktrace
+          build() { ( cd android && chmod +x gradlew && ./gradlew assembleDebug assembleRelease --no-daemon --stacktrace ); }
+          if build; then
+            echo "Built with the native keep-alive service."
+          else
+            echo "::warning::Gradle build failed WITH the native keep-alive service - rebuilding without it so you still get an APK. Send the log of this step to the developer."
+            rm -rf android
+            npx cap add android
+            NO_NATIVE=1 node scripts/patch-android.mjs
+            npx cap sync android
+            build
+          fi
 
-      - name: Sign release APK
+      - name: Sign APKs
         id: sign
         working-directory: ${{ steps.locate.outputs.src }}
         shell: bash
@@ -124,25 +182,36 @@ jobs:
         run: |
           set -euo pipefail
           OUT="$PWD/dist-apk"; mkdir -p "$OUT"
+          KS="$RUNNER_TEMP/signing.ks"; rm -f "$KS"
           if [ -n "${KS_B64:-}" ]; then
-            echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            echo "$KS_B64" | base64 -d > "$KS"
             ALIAS="${KEY_ALIAS}"; SPASS="${KS_PASS}"; KPASS="${KEY_PASS:-$KS_PASS}"
-            echo "Using your keystore from repository secrets"
+            echo "Signing with the keystore from repository secrets (release key)"
+          elif [ -f test-keystore/peerlink-test.p12 ]; then
+            cp test-keystore/peerlink-test.p12 "$KS"
+            ALIAS=peerlink-test; SPASS=peerlink-test; KPASS=peerlink-test
+            echo "::notice::Signed with the committed PUBLIC test key: fine for testing, builds update in place. Add keystore secrets for real releases."
           else
             ALIAS=peerlink; SPASS=peerlink-ci-key; KPASS=peerlink-ci-key
-            keytool -genkeypair -keystore "$RUNNER_TEMP/release.jks" -alias "$ALIAS" -keyalg RSA -keysize 2048 -validity 10000 \
+            keytool -genkeypair -keystore "$KS" -alias "$ALIAS" -keyalg RSA -keysize 2048 -validity 10000 \
               -storepass "$SPASS" -keypass "$KPASS" -dname "CN=PeerLink CI, O=PeerLink, C=US" >/dev/null 2>&1
-            echo "::notice::No keystore secrets set - signed with a throw-away key. Add ANDROID_KEYSTORE_BASE64 etc. so updates install over older builds."
+            echo "::notice::No stable key available - signed with a throw-away key (updates will need an uninstall)."
           fi
           BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n1)
+          VER="${{ steps.locate.outputs.version }}"
+          sign_apk() { # in out
+            "$BT/zipalign" -p -f 4 "$1" "$RUNNER_TEMP/aligned.apk"
+            "$BT/apksigner" sign --ks "$KS" --ks-key-alias "$ALIAS" --ks-pass "pass:$SPASS" --key-pass "pass:$KPASS" --out "$2" "$RUNNER_TEMP/aligned.apk"
+          }
           REL=$(find android/app/build/outputs/apk/release -name '*.apk' | head -n1)
-          "$BT/zipalign" -p -f 4 "$REL" "$RUNNER_TEMP/aligned.apk"
-          "$BT/apksigner" sign --ks "$RUNNER_TEMP/release.jks" --ks-key-alias "$ALIAS" --ks-pass "pass:$SPASS" --key-pass "pass:$KPASS" \
-            --out "$OUT/PeerLink-${{ steps.locate.outputs.version }}-release.apk" "$RUNNER_TEMP/aligned.apk"
-          "$BT/apksigner" verify --print-certs "$OUT/PeerLink-${{ steps.locate.outputs.version }}-release.apk" | head -n3
-          cp android/app/build/outputs/apk/debug/app-debug.apk "$OUT/PeerLink-${{ steps.locate.outputs.version }}-debug.apk"
+          sign_apk "$REL" "$OUT/PeerLink-$VER-release.apk"
+          "$BT/apksigner" verify --print-certs "$OUT/PeerLink-$VER-release.apk" | head -n3
+          # Debug APK: re-sign with the same stable key; if that fails keep Gradle's own debug signature.
+          DBG=android/app/build/outputs/apk/debug/app-debug.apk
+          sign_apk "$DBG" "$OUT/PeerLink-$VER-debug.apk" || { echo "::warning::could not re-sign debug APK; using Gradle debug signature"; cp "$DBG" "$OUT/PeerLink-$VER-debug.apk"; }
           ls -lh "$OUT"
           echo "out=$OUT" >> "$GITHUB_OUTPUT"
+          mkdir -p "$PWD/smoke-kit" && cp scripts/emulator-smoke.sh "$PWD/smoke-kit/"
 
       - name: Upload APKs
         uses: actions/upload-artifact@v4
@@ -152,6 +221,13 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      - name: Upload smoke-test kit
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-kit
+          path: ${{ steps.locate.outputs.src }}/smoke-kit/emulator-smoke.sh
+          retention-days: 7
+
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release)
         uses: softprops/action-gh-release@v2
@@ -160,3 +236,41 @@ jobs:
           name: PeerLink ${{ steps.locate.outputs.version }} (build ${{ github.run_number }})
           files: ${{ steps.sign.outputs.out }}/*.apk
           generate_release_notes: true
+
+  emulator-smoke:
+    name: Emulator smoke test (informational)
+    needs: apk
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    timeout-minutes: 30
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: PeerLink-APK
+          path: apk
+      - uses: actions/download-artifact@v4
+        with:
+          name: smoke-kit
+          path: smoke
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Boot emulator and run smoke test
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          script: bash ./smoke/emulator-smoke.sh ./apk
+      - name: Upload logcat and screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: emulator-smoke-output
+          path: |
+            logcat.txt
+            screenshot.png
+          if-no-files-found: ignore
